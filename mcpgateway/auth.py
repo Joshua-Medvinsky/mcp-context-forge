@@ -2017,7 +2017,6 @@ async def get_user_email_from_token(payload: dict, db: Session) -> Optional[str]
         >>> email is None
         True
     """
-    import uuid as _uuid
 
     sub = payload.get("sub")
     if not sub:
@@ -2028,7 +2027,7 @@ async def get_user_email_from_token(payload: dict, db: Session) -> Optional[str]
 
     # Try as UUID (new format)
     try:
-        _uuid.UUID(sub)
+        uuid.UUID(sub)
         user = db.query(EmailUser).filter(EmailUser.id == sub).first()
         return user.email if user else None
     except ValueError:
