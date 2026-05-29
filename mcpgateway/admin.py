@@ -6435,7 +6435,7 @@ async def admin_update_team(
         is_htmx = request.headers.get("HX-Request") == "true"
 
         if is_htmx:
-            return HTMLResponse(content=f'<div class="text-red-500">Error updating team: {html.escape(str(e))}</div>', status_code=500)
+            return HTMLResponse(content=f'<div class="text-red-500">Error updating team: {html.escape(str(e))}</div>', status_code=400)
         # For regular form submission, redirect to admin page with error parameter
         error_msg = urllib.parse.quote(f"Error updating team: {str(e)}")
         return RedirectResponse(url=f"{root_path}/admin/?error={error_msg}#teams", status_code=303)
@@ -6474,7 +6474,7 @@ async def admin_delete_team(
         deleted = await team_service.delete_team(team_id, deleted_by=user_email)
 
         if not deleted:
-            return HTMLResponse(content='<div class="text-red-500">Team cannot be deleted due to business constraints</div>', status_code=409)
+            return HTMLResponse(content='<div class="text-red-500">Team cannot be deleted due to business constraints</div>', status_code=400)
 
         # Return success message with script to refresh teams list
         safe_team_name = html.escape(team_name)
@@ -12313,7 +12313,6 @@ async def admin_discover_oauth(
 @require_permission("gateways.create", allow_admin_bypass=False)
 async def admin_add_gateway(
     request: Request,
-    gateway_data: Optional[GatewayCreate] = None,
     db: Session = Depends(get_db),
     user: dict[str, Any] = Depends(get_current_user_with_permissions),
 ) -> JSONResponse:
@@ -12356,17 +12355,11 @@ async def admin_add_gateway(
     LOGGER.debug(f"User {get_user_email(user)} is adding a new gateway")
 
     # Parse request data (supports both JSON and form-data)
-    if gateway_data is None:
-        data = await _parse_gateway_data_from_request(request)
-        team_id = data.get("team_id")
-        if team_id and isinstance(team_id, str):
-            team_id = team_id.strip() or None
-        visibility = str(data.get("visibility", "private"))
-    else:
-        # JSON request with Pydantic model
-        data = gateway_data.model_dump(exclude_unset=True)
-        team_id = data.get("team_id")
-        visibility = str(data.get("visibility", "private"))
+    data = await _parse_gateway_data_from_request(request)
+    team_id = data.get("team_id")
+    if team_id and isinstance(team_id, str):
+        team_id = team_id.strip() or None
+    visibility = str(data.get("visibility", "private"))
 
     _check_public_visibility_allowed(visibility, team_id=team_id)
 
@@ -12406,9 +12399,6 @@ async def admin_add_gateway(
 
         # Create GatewayCreate model from data
         gateway = GatewayCreate(**data)
-    except KeyError as e:
-        # Convert KeyError to ValidationError-like response
-        return ORJSONResponse(content={"message": f"Missing required field: {e}", "success": False}, status_code=422)
 
     except ValidationError as ex:
         # --- Getting only the custom message from the ValueError ---
@@ -12490,7 +12480,6 @@ async def admin_add_gateway(
 async def admin_update_gateway_rest(
     gateway_id: str,
     request: Request,
-    gateway_data: Optional[GatewayUpdate] = None,
     db: Session = Depends(get_db),
     user: dict[str, Any] = Depends(get_current_user_with_permissions),
 ) -> JSONResponse:
@@ -12519,22 +12508,16 @@ async def admin_update_gateway_rest(
     """
     LOGGER.debug(f"User {get_user_email(user)} is updating gateway ID {gateway_id}")
 
-    # Parse request data (supports both JSON and form-data)
-    if gateway_data is None:
+    try:
+        # Parse request data (supports both JSON and form-data)
         data = await _parse_gateway_data_from_request(request)
         team_id = data.get("team_id")
         if team_id and isinstance(team_id, str):
             team_id = team_id.strip() or None
         visibility = str(data.get("visibility", "private"))
-    else:
-        # JSON request with Pydantic model
-        data = gateway_data.model_dump(exclude_unset=True)
-        team_id = data.get("team_id")
-        visibility = str(data.get("visibility", "private"))
 
-    _check_public_visibility_allowed(visibility, team_id=team_id)
+        _check_public_visibility_allowed(visibility, team_id=team_id)
 
-    try:
         # Handle OAuth client secret encryption if present
         oauth_config = data.get("oauth_config")
         if oauth_config and isinstance(oauth_config, dict) and "client_secret" in oauth_config:
@@ -12550,18 +12533,25 @@ async def admin_update_gateway_rest(
 
         user_email = get_user_email(user)
 
-        # Preserve existing gateway's team_id when no explicit team_id is provided
+        # Preserve existing gateway's team_id and owner_email when not explicitly provided
+        existing_gateway = db.get(DbGateway, gateway_id)
+        if not existing_gateway:
+            raise GatewayNotFoundError(f"Gateway with ID {gateway_id} not found")
+
         if not team_id:
-            existing_gateway = db.get(DbGateway, gateway_id)
-            existing_team = getattr(existing_gateway, "team_id", None) if existing_gateway else None
+            existing_team = getattr(existing_gateway, "team_id", None)
             if isinstance(existing_team, str) and existing_team:
                 team_id = existing_team
 
         team_service = TeamManagementService(db)
         team_id = await team_service.verify_team_for_user(user_email, team_id)
 
-        # Add ownership fields
-        data["owner_email"] = user_email
+        # Preserve original owner_email unless explicitly provided in the update
+        if "owner_email" not in data:
+            existing_owner = getattr(existing_gateway, "owner_email", None)
+            if existing_owner:
+                data["owner_email"] = existing_owner
+
         data["team_id"] = team_id
 
         # Create GatewayUpdate model from data
@@ -12582,34 +12572,37 @@ async def admin_update_gateway_rest(
             content={"message": "Gateway updated successfully!", "success": True},
             status_code=200,
         )
+    except GatewayNotFoundError as e:
+        LOGGER.warning(f"Gateway not found: {e}")
+        return ORJSONResponse(content={"message": str(e), "success": False}, status_code=404)
     except PermissionError as e:
         LOGGER.info(f"Permission denied for user {get_user_email(user)}: {e}")
         return ORJSONResponse(content={"message": str(e), "success": False}, status_code=403)
     except HTTPException:
         raise
+    except GatewayConnectionError as ex:
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=502)
+    except RuntimeError as ex:
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+    except ValidationError as ex:
+        return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+    except IntegrityError as ex:
+        return ORJSONResponse(status_code=409, content=ErrorFormatter.format_database_error(ex))
+    except ValueError as ex:
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=400)
     except Exception as ex:
-        if isinstance(ex, GatewayConnectionError):
-            return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=502)
-        if isinstance(ex, RuntimeError):
-            return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
-        if isinstance(ex, ValidationError):
-            return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
-        if isinstance(ex, IntegrityError):
-            return ORJSONResponse(status_code=409, content=ErrorFormatter.format_database_error(ex))
-        if isinstance(ex, ValueError):
-            return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=400)
         LOGGER.exception(f"Unexpected error in admin_update_gateway_rest: {ex}")
         return ORJSONResponse(content={"message": "An unexpected error occurred. Please try again or contact support.", "success": False}, status_code=500)
 
 
 # RESTful DELETE endpoint for gateway deletion
-@admin_router.delete("/gateways/{gateway_id}", response_model=None)
+@admin_router.delete("/gateways/{gateway_id}", response_model=None, status_code=204)
 @require_permission("gateways.delete", allow_admin_bypass=False)
 async def admin_delete_gateway_rest(
     gateway_id: str,
     db: Session = Depends(get_db),
     user: dict[str, Any] = Depends(get_current_user_with_permissions),
-) -> JSONResponse:
+) -> Response:
     """Delete a gateway via REST API (DELETE).
 
     Args:
@@ -12618,17 +12611,17 @@ async def admin_delete_gateway_rest(
         user: Authenticated user.
 
     Returns:
-        JSON response with success status and message.
+        204 No Content on success.
     """
     user_email = get_user_email(user)
     LOGGER.debug(f"User {user_email} is deleting gateway ID {gateway_id}")
 
     try:
         await gateway_service.delete_gateway(db, gateway_id, user_email=user_email)
-        return ORJSONResponse(
-            content={"message": "Gateway deleted successfully!", "success": True},
-            status_code=200,
-        )
+        return Response(status_code=204)
+    except GatewayNotFoundError as e:
+        LOGGER.warning(f"Gateway not found: {e}")
+        return ORJSONResponse(content={"message": str(e), "success": False}, status_code=404)
     except PermissionError as e:
         LOGGER.warning(f"Permission denied for user {user_email} deleting gateway {gateway_id}: {e}")
         return ORJSONResponse(content={"message": str(e), "success": False}, status_code=403)
@@ -14309,14 +14302,13 @@ async def admin_test_gateway(
     parsed_validated_base_url = urllib.parse.urlparse(validated_base_url)
     pinned_ip_is_ipv6 = ":" in pinned_resolved_ip
     if parsed_validated_base_url.port is not None:
-        pinned_netloc = f"[{pinned_resolved_ip}]:{parsed_validated_base_url.port}" if pinned_ip_is_ipv6 else f"{pinned_resolved_ip}:{parsed_validated_base_url.port}"
         original_authority = f"{validated_hostname}:{parsed_validated_base_url.port}"
     else:
-        pinned_netloc = f"[{pinned_resolved_ip}]" if pinned_ip_is_ipv6 else pinned_resolved_ip
+        f"[{pinned_resolved_ip}]" if pinned_ip_is_ipv6 else pinned_resolved_ip
         original_authority = validated_hostname
 
-    pinned_base_url = urllib.parse.urlunparse(parsed_validated_base_url._replace(netloc=pinned_netloc))
-    full_url = pinned_base_url.rstrip("/") + "/" + request.path.lstrip("/")
+    # Use the validated base URL (not the pinned IP) for the final URL construction
+    full_url = validated_base_url.rstrip("/") + "/" + request.path.lstrip("/")
     full_url = full_url.rstrip("/")
     safe_validated_url = sanitize_url_for_logging(validated_base_url)
     LOGGER.info(

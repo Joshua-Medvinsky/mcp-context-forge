@@ -176,39 +176,40 @@ class GatewayAPITester:
                 )
 
                 print(f"\n📥 Response Status: {response.status_code}")
-                print(f"📥 Response Body: {response.text}")
 
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("success"):
-                        print("✅ Gateway deleted successfully!")
-                        return True
-                    else:
-                        print(f"❌ Deletion failed: {data.get('message')}")
-                        return False
+                if response.status_code == 204:
+                    print("✅ Gateway deleted successfully (204 No Content)!")
+                    return True
+                elif response.status_code == 200:
+                    # Also accept 200 for backward compatibility during transition
+                    print("⚠️  Gateway deleted with 200 OK (should be 204 No Content)")
+                    return True
                 else:
                     print(f"❌ Request failed with status {response.status_code}")
+                    if response.text:
+                        print(f"📥 Response Body: {response.text}")
                     return False
 
         except Exception as e:
             print(f"❌ Error: {e}")
             return False
 
-    async def test_json_vs_form_endpoints(self) -> bool:
-        """Test that JSON endpoint works and form endpoint is separate."""
+    async def test_form_data_support(self) -> bool:
+        """Test that the endpoint accepts form data (multipart/form-data)."""
         print("\n" + "="*60)
-        print("TEST 4: Verify JSON-only REST Endpoint Behavior")
+        print("TEST 4: Verify Form Data Support")
         print("="*60)
 
-        # Test that form data to REST endpoint returns 422 (expected behavior)
+        # Test that form data to REST endpoint is accepted (200 or 201)
         form_data = {
             "name": "test-form-gateway",
             "url": "http://httpbin.org/delay/0",
             "transport": "SSE",
-            "description": "Test gateway created via form data"
+            "description": "Test gateway created via form data",
+            "skip_initialization": "true"
         }
 
-        print(f"\n📤 Sending form data to JSON-only endpoint (should fail with 422)")
+        print(f"\n📤 Sending form data to endpoint (should succeed)")
         print(f"📦 Form Data: {form_data}")
 
         try:
@@ -225,13 +226,21 @@ class GatewayAPITester:
                 )
 
                 print(f"\n📥 Response Status: {response.status_code}")
+                print(f"📥 Response Body: {response.text}")
 
-                if response.status_code == 422:
-                    print("✅ Correctly rejected form data (JSON-only endpoint working as expected)")
-                    return True
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("success"):
+                        print("✅ Form data accepted successfully (endpoint supports both JSON and form-data)")
+                        # Store gateway ID for cleanup if needed
+                        if "gateway_id" in data:
+                            print(f"   Gateway ID: {data['gateway_id']}")
+                        return True
+                    else:
+                        print(f"❌ Request succeeded but operation failed: {data.get('message')}")
+                        return False
                 else:
-                    print(f"❌ Unexpected status code: {response.status_code} (expected 422)")
-                    print(f"📥 Response Body: {response.text}")
+                    print(f"❌ Unexpected status code: {response.status_code} (expected 200)")
                     return False
 
         except Exception as e:
@@ -273,9 +282,9 @@ class GatewayAPITester:
             results.append(("Update Gateway (JSON)", False))
             results.append(("Delete Gateway", False))
 
-        # Test 4: JSON-only endpoint behavior
-        result4 = await self.test_json_vs_form_endpoints()
-        results.append(("JSON-only Endpoint Behavior", result4))
+        # Test 4: Form data support
+        result4 = await self.test_form_data_support()
+        results.append(("Form Data Support", result4))
 
         # Print summary
         print("\n" + "="*60)
