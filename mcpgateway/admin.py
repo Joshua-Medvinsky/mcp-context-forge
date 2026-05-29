@@ -14304,7 +14304,6 @@ async def admin_test_gateway(
     if parsed_validated_base_url.port is not None:
         original_authority = f"{validated_hostname}:{parsed_validated_base_url.port}"
     else:
-        f"[{pinned_resolved_ip}]" if pinned_ip_is_ipv6 else pinned_resolved_ip
         original_authority = validated_hostname
 
     # Use the validated base URL (not the pinned IP) for the final URL construction
