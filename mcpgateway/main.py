@@ -178,6 +178,7 @@ from mcpgateway.services.prompt_service import PromptError, PromptLockConflictEr
 from mcpgateway.services.resource_service import ResourceError, ResourceLockConflictError, ResourceNotFoundError, ResourceURIConflictError
 from mcpgateway.services.server_service import ServerError, ServerLockConflictError, ServerNameConflictError, ServerNotFoundError
 from mcpgateway.services.tag_service import TagService
+from mcpgateway.services.dataplane_publisher import DataplanePublisherService
 from mcpgateway.services.tool_service import ToolError, ToolLockConflictError, ToolNameConflictError, ToolNotFoundError
 from mcpgateway.transports.sse_transport import SSETransport
 from mcpgateway.transports.streamablehttp_transport import (
@@ -1315,6 +1316,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     aggregation_loop_task: Optional[asyncio.Task] = None
     aggregation_backfill_task: Optional[asyncio.Task] = None
     siem_export_service: Optional[Any] = None
+    dataplane_publisher_service: Optional[Any] = None
 
     # Initialize logging service FIRST to ensure all logging goes to dual output
     await logging_service.initialize()
@@ -1606,6 +1608,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
         refresh_slugs_on_startup()
 
+        # Initialize experimental dataplane publisher to send config data to redis
+        if settings.dataplane_publisher:
+            dataplane_publisher_service = DataplanePublisherService()
+            await dataplane_publisher_service.start()
         # Bootstrap SSO providers from environment configuration
         if settings.sso_enabled:
             await attempt_to_bootstrap_sso_providers()
@@ -1663,7 +1669,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 Raises:
                     asyncio.CancelledError: When aggregation is stopped
                 """
-                interval_seconds = max(1, int(settings.metrics_aggregation_window_minutes)) * 60
+                interval_seconds = settings.metrics_aggregation_interval_seconds or max(1, int(settings.metrics_aggregation_window_minutes)) * 60
                 logger.info(
                     "Starting log aggregation loop (window=%s min)",
                     log_aggregator.aggregation_window_minutes,
@@ -1808,6 +1814,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             metrics_cleanup_service = get_metrics_cleanup_service()
             services_to_shutdown.insert(2, metrics_cleanup_service)
 
+        if dataplane_publisher_service is not None:
+            services_to_shutdown.insert(3, dataplane_publisher_service)
+
         await shutdown_services(services_to_shutdown)
 
         # Shutdown session-affinity service (before shared HTTP client).
@@ -1894,6 +1903,17 @@ def validate_security_configuration():
     logger.info("🔒 Validating security configuration...")
     try:
         current_settings = get_settings()
+
+        for _field_name, _secret_field in (
+            ("jwt_secret_key", current_settings.jwt_secret_key),
+            ("auth_encryption_secret", current_settings.auth_encryption_secret),
+        ):
+            _val = _secret_field.get_secret_value()
+            if _val.lower().startswith("__replace_me__"):
+                _msg = f"{_field_name}: Value is an unset placeholder (__REPLACE_ME__). Run 'python -m mcpgateway.scripts.init_secrets' to generate strong values."
+                if str(current_settings.environment).lower() == "production":
+                    raise SecurityConfigurationError(_msg)
+                logger.warning("🔓 SECURITY WARNING - %s", _msg)
 
         security_status: settings.SecurityStatus = current_settings.get_security_status()
         security_warnings = security_status["warnings"]
@@ -2809,8 +2829,10 @@ class MCPPathRewriteMiddleware:
     """
     Middleware that rewrites paths ending with '/mcp' to '/mcp/', after performing authentication.
 
+    - Rewrites exact '/mcp' to '/mcp/' so Starlette's mount does not emit a 307 redirect.
     - Rewrites paths like '/servers/<server_id>/mcp' to '/mcp/'.
-    - Only paths ending with '/mcp' or '/mcp/' (but not exactly '/mcp' or '/mcp/') are rewritten.
+    - Keeps ASGI ``raw_path`` aligned with rewritten paths when present.
+    - Only exact '/mcp' and server-scoped MCP transport paths are rewritten.
     - Authentication is performed before any path rewriting.
     - If authentication fails, the request is not processed further.
     - All other requests are passed through without change.
@@ -2927,6 +2949,13 @@ class MCPPathRewriteMiddleware:
             >>> with patch('mcpgateway.main.streamable_http_auth', return_value=True):
             ...     asyncio.run(middleware._call_streamable_http(scope, receive, send))
             >>> app_mock.assert_called_once_with(scope, receive, send)
+
+            >>> # Exact /mcp is normalized to avoid Starlette's mount redirect.
+            >>> scope = {"type": "http", "path": "/mcp"}
+            >>> with patch('mcpgateway.main.streamable_http_auth', return_value=True):
+            ...     asyncio.run(middleware._call_streamable_http(scope, receive, send))
+            >>> scope["path"]
+            '/mcp/'
         """
         # Auth check first
         auth_ok = await streamable_http_auth(scope, receive, send)
@@ -2950,7 +2979,11 @@ class MCPPathRewriteMiddleware:
         # Skip rewriting for well-known URIs (RFC 9728 OAuth metadata, etc.)
         # These paths may end with /mcp but should not be rewritten to the MCP transport
         if not app_path.startswith("/.well-known/"):
-            if (app_path.endswith("/mcp") and app_path != "/mcp") or (app_path.endswith("/mcp/") and app_path != "/mcp/"):
+            if app_path == "/mcp":
+                self._apply_mcp_rewrite(scope, root_path)
+                await self.application(scope, receive, send)
+                return
+            if app_path.endswith("/mcp") or (app_path.endswith("/mcp/") and app_path != "/mcp/"):
                 # SECURITY: Only rewrite recognised MCP paths — /servers/{id}/mcp.
                 # Arbitrary prefixes (e.g. /foo/mcp) must NOT be rewritten to
                 # /mcp/ as that would expose the global MCP transport under
@@ -2971,10 +3004,27 @@ class MCPPathRewriteMiddleware:
                     return
                 # Rewrite to /mcp/ and continue through middleware (lets CORSMiddleware handle preflight)
                 # Preserve root_path prefix when rewriting
-                scope["path"] = f"{root_path}/mcp/" if root_path else "/mcp/"
+                self._apply_mcp_rewrite(scope, root_path)
                 await self.application(scope, receive, send)
                 return
         await self.application(scope, receive, send)
+
+    @staticmethod
+    def _apply_mcp_rewrite(scope, root_path: str) -> str:
+        """Rewrite a validated MCP transport path to the mounted /mcp/ app path."""
+        original_path = scope.get("path", "")
+        new_path = f"{root_path}/mcp/" if root_path else "/mcp/"
+        scope["path"] = new_path
+
+        if "raw_path" in scope:
+            try:
+                # ASGI raw_path stores raw octets; latin-1 preserves a 1:1 byte mapping for valid values.
+                scope["raw_path"] = new_path.encode("latin-1")
+            except (UnicodeEncodeError, ValueError):
+                logger.warning("MCPPathRewriteMiddleware: non-latin-1 raw_path skipped for %s", new_path)
+
+        logger.debug("MCPPathRewriteMiddleware: %s -> %s", original_path, new_path)
+        return new_path
 
 
 # Configure CORS with environment-aware origins
@@ -7324,7 +7374,13 @@ async def remove_root(
         Status message indicating result.
     """
     logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested to remove root with URI: {uri}")
-    await root_service.remove_root(uri)
+    try:
+        await root_service.remove_root(uri)
+    except RootServiceNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"Root not found: {uri}") from e
+    except Exception as e:
+        logger.exception(f"Unexpected error removing root {uri}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}") from e
     return {"status": "success", "message": f"Root {uri} removed"}
 
 
@@ -10562,10 +10618,17 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
                     result = {"contents": [result.model_dump(by_alias=True, exclude_none=True)]}
                 else:
                     result = {"contents": [result]}
-            except (ValueError, ResourceNotFoundError):
+            except (ValueError, ResourceNotFoundError) as e:
                 # Resource not found in the gateway
                 logger.error("Resource not found: %s", uri)
-                raise JSONRPCError(-32002, f"Resource not found: {uri}", {"uri": uri})
+                raise JSONRPCError(-32002, f"Resource not found: {uri}", {"uri": uri}) from e
+            except ResourceError as e:
+                # Other resource errors (ambiguous URI, proxy failures, path validation, etc.)
+                logger.error("Resource read failed: %s", str(e))
+                raise JSONRPCError(-32000, f"Resource read failed: {str(e)}", {"uri": uri}) from e
+            except Exception as e:
+                logger.exception(f"Unexpected error in resources/read for {uri}: {e}")
+                raise JSONRPCError(-32603, f"Internal error: {str(e)}", {"uri": uri}) from e
             # Release transaction after resources/read completes
             db.commit()
             db.close()
@@ -10639,17 +10702,25 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
             # Get plugin contexts from request.state for cross-hook sharing
             plugin_context_table = getattr(request.state, "plugin_context_table", None)
             plugin_global_context = getattr(request.state, "plugin_global_context", None)
-            result = await prompt_service.get_prompt(
-                db,
-                name,
-                arguments,
-                user=auth_user_email,
-                server_id=server_id,
-                token_teams=auth_token_teams,
-                plugin_context_table=plugin_context_table,
-                plugin_global_context=plugin_global_context,
-                _meta_data=meta_data,
-            )
+            try:
+                result = await prompt_service.get_prompt(
+                    db,
+                    name,
+                    arguments,
+                    user=auth_user_email,
+                    server_id=server_id,
+                    token_teams=auth_token_teams,
+                    plugin_context_table=plugin_context_table,
+                    plugin_global_context=plugin_global_context,
+                    _meta_data=meta_data,
+                )
+            except PromptNotFoundError as e:
+                raise JSONRPCError(-32002, str(e), {"name": name}) from e
+            except PromptError as e:
+                raise JSONRPCError(-32000, f"Prompt retrieval failed: {str(e)}", {"name": name}) from e
+            except Exception as e:
+                logger.exception(f"Unexpected error in prompts/get for {name}: {e}")
+                raise JSONRPCError(-32603, f"Internal error: {str(e)}", {"name": name}) from e
             if hasattr(result, "model_dump"):
                 result = result.model_dump(by_alias=True, exclude_none=True)
             # Release transaction after prompts/get completes
@@ -11246,7 +11317,11 @@ async def set_log_level(request: Request, user=Depends(get_current_user_with_per
     """
     logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested to set log level")
     body = await _read_request_json(request)
-    level = LogLevel(body["level"])
+    try:
+        # Normalize to lowercase before enum construction
+        level = LogLevel(body["level"].lower())
+    except (ValueError, KeyError, AttributeError) as e:
+        raise HTTPException(status_code=422, detail=f"Invalid log level: {body.get('level', 'missing')}") from e
     await logging_service.set_level(level)
 
 

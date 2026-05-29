@@ -749,6 +749,12 @@ class Settings(BaseSettings):
             "Default true for maximum security (test only what's already registered)."
         ),
     )
+    gateway_test_dns_timeout: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=30.0,
+        description="Timeout in seconds for DNS resolution performed during /admin/gateways/test validation.",
+    )
 
     # UAID Cross-Gateway Routing Security
     uaid_allowed_domains: List[str] = Field(
@@ -1459,23 +1465,25 @@ class Settings(BaseSettings):
         Returns:
             Itself.
         """
-        # Reject weak/default secrets in non-development environments.
-        # This check applies regardless of client_mode — client_mode was intended to skip
-        # operational warnings (auth_required, SSL, debug), not secret-strength enforcement.
+        # __REPLACE_ME__ placeholders block startup only in production; warn in other environments.
+        # Weak/default secrets are rejected in any non-development environment (staging + production).
+        # client_mode is intentionally NOT exempted — secret-strength enforcement is always active.
         weak_secrets = {v.lower() for v in self.WEAK_VALUES}
         env = str(self.environment).lower()
         for field_name, secret_field in (("jwt_secret_key", self.jwt_secret_key), ("auth_encryption_secret", self.auth_encryption_secret)):
             val = secret_field.get_secret_value()
             if val.lower().startswith("__replace_me__"):
-                raise SecurityConfigurationError(f"{field_name}: Value is an unset placeholder (__REPLACE_ME__). " "Run 'python -m mcpgateway.scripts.init_secrets' to generate strong values.")
+                if env == "production":
+                    raise SecurityConfigurationError(f"{field_name}: Value is an unset placeholder (__REPLACE_ME__). " "Run 'python -m mcpgateway.scripts.init_secrets' to generate strong values.")
+                logger.warning(f"🔓 SECURITY WARNING - {field_name}: Value is an unset placeholder (__REPLACE_ME__). Run 'python -m mcpgateway.scripts.init_secrets' to generate strong values.")
             if val.lower() in weak_secrets:
                 if env != "development":
                     raise SecurityConfigurationError(
                         f"{field_name}: Weak/default secret rejected in '{env}' environment. " "Run 'python -m mcpgateway.scripts.init_secrets' to generate strong values."
                     )
-        # In development mode, weak secrets are allowed but the `validate_secrets` field
-        # validator (above) still emits a SECURITY WARNING for each affected field.
-        # This satisfies the spec requirement that development environments warn on weak secrets.
+        # In non-production environments, unset placeholder secrets emit SECURITY WARNINGs but
+        # do not block startup. Production always rejects them. Weak secrets are rejected in
+        # staging and production; development allows them with warnings from the field validator.
 
         if not self.client_mode:
             # Check for dangerous combinations - only log warnings, don't raise errors
@@ -1935,6 +1943,15 @@ class Settings(BaseSettings):
     metrics_aggregation_backfill_hours: int = Field(default=6, ge=0, le=168, description="Hours of structured logs to backfill into performance metrics on startup")
     metrics_aggregation_window_minutes: int = Field(default=5, description="Time window for metrics aggregation (minutes)")
     metrics_aggregation_auto_start: bool = Field(default=False, description="Automatically run the log aggregation loop on application startup")
+    metrics_aggregation_interval_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Seconds between aggregation runs. "
+            "Defaults to metrics_aggregation_window_minutes * 60 when unset. "
+            "Set higher (e.g. 900) to reduce background DB pressure on multi-worker deployments."
+        ),
+    )
     yield_batch_size: int = Field(
         default=1000,
         ge=100,
@@ -2558,7 +2575,9 @@ class Settings(BaseSettings):
     redis_ssl_ca_certs: Optional[str] = Field(default=None, description="Path to CA certificate bundle used to verify the Redis server certificate")
     redis_ssl_certfile: Optional[str] = Field(default=None, description="Path to client certificate for mutual TLS (mTLS) authentication with Redis")
     redis_ssl_keyfile: Optional[str] = Field(default=None, description="Path to client private key for mutual TLS (mTLS) authentication with Redis")
-    redis_ssl_check_hostname: bool = Field(default=True, description="Verify the Redis TLS certificate chain and hostname. Set False only for self-signed certs (pair with REDIS_SSL_CA_CERTS for the CA bundle)")
+    redis_ssl_check_hostname: bool = Field(
+        default=True, description="Verify the Redis TLS certificate chain and hostname. Set False only for self-signed certs (pair with REDIS_SSL_CA_CERTS for the CA bundle)"
+    )
 
     redis_operation_timeout: float = Field(
         default=0.5, gt=0.0, description="Timeout for individual Redis operations in seconds (get/set/delete). " "Should be lower than redis_socket_timeout for faster fallback to in-memory cache."
@@ -2652,8 +2671,6 @@ class Settings(BaseSettings):
     otel_bsp_schedule_delay: int = Field(default=5000, description="Schedule delay in milliseconds")
 
     # ===================================
-
-    # ===================================
     # OpenTelemetry Baggage Configuration
     # ===================================
 
@@ -2692,6 +2709,14 @@ class Settings(BaseSettings):
     otel_baggage_log_sanitization: bool = Field(
         default=True,
         description="Log sanitization events for compliance tracking",
+    )
+
+    # ===================================
+    # Experimental dataplane config
+    # ===================================
+
+    dataplane_publisher: bool = Field(default=False,
+        description="Send data from CF to Rust experimental dataplane"
     )
 
     # Well-Known URI Configuration

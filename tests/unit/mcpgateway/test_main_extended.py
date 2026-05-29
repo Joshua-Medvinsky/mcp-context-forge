@@ -29,7 +29,9 @@ from fastapi.testclient import TestClient
 import orjson
 import pytest
 import sqlalchemy as sa
+from starlette.applications import Starlette
 from starlette.responses import Response as StarletteResponse
+from starlette.routing import Mount
 
 # First-Party
 from mcpgateway.common.models import LogLevel
@@ -2963,6 +2965,180 @@ class TestMCPPathRewriteMiddleware:
     """Cover MCPPathRewriteMiddleware branches."""
 
     @pytest.mark.asyncio
+    async def test_rewrite_exact_mcp_path_prevents_mount_redirect(self):
+        """Exact /mcp is internally normalized so Starlette Mount cannot emit 307."""
+        app_mock = AsyncMock()
+        middleware = MCPPathRewriteMiddleware(app_mock)
+        scope = {"type": "http", "path": "/mcp", "headers": []}
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+            await middleware._call_streamable_http(scope, receive, send)
+
+        assert scope["modified_path"] == "/mcp"
+        assert scope["path"] == "/mcp/"
+        app_mock.assert_called_once_with(scope, receive, send)
+
+    def test_rewrite_exact_mcp_path_avoids_starlette_mount_redirect(self):
+        """Exact /mcp reaches the mounted app without Starlette returning 307."""
+
+        async def mounted_app(scope, receive, send):
+            response = StarletteResponse("ok")
+            await response(scope, receive, send)
+
+        app_with_mount = Starlette(routes=[Mount("/mcp", app=mounted_app)])
+        middleware = MCPPathRewriteMiddleware(app_with_mount)
+
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+            response = TestClient(middleware).get("/mcp", follow_redirects=False)
+
+        assert response.status_code == 200
+        assert response.headers.get("location") is None
+
+    def test_rewrite_exact_mcp_post_avoids_starlette_mount_redirect(self):
+        """POST /mcp is normalized the same way as GET for Streamable HTTP."""
+
+        async def mounted_app(scope, receive, send):
+            response = StarletteResponse("ok")
+            await response(scope, receive, send)
+
+        app_with_mount = Starlette(routes=[Mount("/mcp", app=mounted_app)])
+        middleware = MCPPathRewriteMiddleware(app_with_mount)
+
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+            response = TestClient(middleware).post("/mcp", content=b"{}", follow_redirects=False)
+
+        assert response.status_code == 200
+        assert response.headers.get("location") is None
+
+    @pytest.mark.asyncio
+    async def test_rewrite_exact_mcp_path_updates_raw_path(self):
+        """Exact /mcp normalization keeps raw_path aligned with path."""
+        app_mock = AsyncMock()
+        middleware = MCPPathRewriteMiddleware(app_mock)
+        scope = {"type": "http", "path": "/mcp", "raw_path": b"/mcp", "headers": []}
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+            await middleware._call_streamable_http(scope, receive, send)
+
+        assert scope["path"] == "/mcp/"
+        assert scope["raw_path"] == b"/mcp/"
+        app_mock.assert_called_once_with(scope, receive, send)
+
+    @pytest.mark.asyncio
+    async def test_rewrite_exact_mcp_path_skips_non_latin_raw_path(self, caplog):
+        """Malformed proxy prefixes must not crash raw_path byte alignment."""
+        app_mock = AsyncMock()
+        middleware = MCPPathRewriteMiddleware(app_mock)
+        scope = {
+            "type": "http",
+            "path": "/gateway/中/mcp",
+            "root_path": "/gateway/中",
+            "raw_path": b"/gateway/%E4%B8%AD/mcp",
+            "headers": [],
+        }
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        caplog.set_level("WARNING")
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+            await middleware._call_streamable_http(scope, receive, send)
+
+        assert scope["path"] == "/gateway/中/mcp/"
+        assert scope["raw_path"] == b"/gateway/%E4%B8%AD/mcp"
+        assert any("non-latin-1 raw_path skipped" in rec.message for rec in caplog.records)
+        app_mock.assert_called_once_with(scope, receive, send)
+
+    @pytest.mark.asyncio
+    async def test_exact_mcp_path_with_root_path_preserves_prefix(self):
+        """Exact /mcp normalization preserves reverse-proxy root_path prefixes."""
+        app_mock = AsyncMock()
+        middleware = MCPPathRewriteMiddleware(app_mock)
+        scope = {"type": "http", "path": "/gateway/mcp", "root_path": "/gateway", "headers": []}
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+            await middleware._call_streamable_http(scope, receive, send)
+
+        assert scope["modified_path"] == "/mcp"
+        assert scope["path"] == "/gateway/mcp/"
+        app_mock.assert_called_once_with(scope, receive, send)
+
+    @pytest.mark.asyncio
+    async def test_exact_mcp_path_with_app_root_path_preserves_prefix(self):
+        """Exact /mcp normalization also works when APP_ROOT_PATH supplies the prefix."""
+        app_mock = AsyncMock()
+        middleware = MCPPathRewriteMiddleware(app_mock)
+        scope = {"type": "http", "path": "/gateway/mcp", "root_path": "", "headers": []}
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with patch("mcpgateway.config.settings.app_root_path", "/gateway"):
+            with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+                await middleware._call_streamable_http(scope, receive, send)
+
+        assert scope["modified_path"] == "/mcp"
+        assert scope["path"] == "/gateway/mcp/"
+        app_mock.assert_called_once_with(scope, receive, send)
+
+    @pytest.mark.asyncio
+    async def test_exact_mcp_with_trailing_slash_passes_through(self):
+        """Exact /mcp/ is already canonical and should not be rewritten again."""
+        app_mock = AsyncMock()
+        middleware = MCPPathRewriteMiddleware(app_mock)
+        scope = {"type": "http", "path": "/mcp/", "headers": []}
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+            await middleware._call_streamable_http(scope, receive, send)
+
+        assert scope["modified_path"] == "/mcp/"
+        assert scope["path"] == "/mcp/"
+        app_mock.assert_called_once_with(scope, receive, send)
+
+    @pytest.mark.asyncio
+    async def test_well_known_mcp_suffix_is_not_rewritten(self):
+        """RFC 9728 well-known resource URLs ending in /mcp must not hit the MCP transport."""
+        app_mock = AsyncMock()
+        middleware = MCPPathRewriteMiddleware(app_mock)
+        scope = {"type": "http", "path": "/.well-known/oauth-protected-resource/servers/123/mcp", "headers": []}
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+            await middleware._call_streamable_http(scope, receive, send)
+
+        assert scope["modified_path"] == "/.well-known/oauth-protected-resource/servers/123/mcp"
+        assert scope["path"] == "/.well-known/oauth-protected-resource/servers/123/mcp"
+        app_mock.assert_called_once_with(scope, receive, send)
+
+    @pytest.mark.asyncio
+    async def test_well_known_mcp_suffix_with_root_path_is_not_rewritten(self):
+        """Root-path-stripped well-known metadata URLs must not hit the MCP transport."""
+        app_mock = AsyncMock()
+        middleware = MCPPathRewriteMiddleware(app_mock)
+        scope = {
+            "type": "http",
+            "path": "/gateway/.well-known/oauth-protected-resource/servers/123/mcp",
+            "root_path": "/gateway",
+            "headers": [],
+        }
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+            await middleware._call_streamable_http(scope, receive, send)
+
+        assert scope["modified_path"] == "/.well-known/oauth-protected-resource/servers/123/mcp"
+        assert scope["path"] == "/gateway/.well-known/oauth-protected-resource/servers/123/mcp"
+        app_mock.assert_called_once_with(scope, receive, send)
+
+    @pytest.mark.asyncio
     async def test_rewrite_mcp_path(self):
         app_mock = AsyncMock()
         middleware = MCPPathRewriteMiddleware(app_mock)
@@ -2977,6 +3153,22 @@ class TestMCPPathRewriteMiddleware:
         app_mock.assert_called_once_with(scope, receive, send)
 
     @pytest.mark.asyncio
+    async def test_rewrite_server_mcp_path_updates_raw_path(self):
+        """Server-scoped MCP rewrites keep raw_path aligned with path."""
+        app_mock = AsyncMock()
+        middleware = MCPPathRewriteMiddleware(app_mock)
+        scope = {"type": "http", "path": "/servers/123/mcp", "raw_path": b"/servers/123/mcp", "headers": []}
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=True)):
+            await middleware._call_streamable_http(scope, receive, send)
+
+        assert scope["path"] == "/mcp/"
+        assert scope["raw_path"] == b"/mcp/"
+        app_mock.assert_called_once_with(scope, receive, send)
+
+    @pytest.mark.asyncio
     async def test_rewrite_auth_failure(self):
         app_mock = AsyncMock()
         middleware = MCPPathRewriteMiddleware(app_mock)
@@ -2987,6 +3179,22 @@ class TestMCPPathRewriteMiddleware:
         with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=False)):
             await middleware._call_streamable_http(scope, receive, send)
 
+        app_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exact_mcp_auth_failure_blocks_rewrite(self):
+        """Exact /mcp auth failures return before normalization mutates the scope."""
+        app_mock = AsyncMock()
+        middleware = MCPPathRewriteMiddleware(app_mock)
+        scope = {"type": "http", "path": "/mcp", "headers": []}
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with patch("mcpgateway.main.streamable_http_auth", new=AsyncMock(return_value=False)):
+            await middleware._call_streamable_http(scope, receive, send)
+
+        assert scope.get("path") == "/mcp"
+        assert "modified_path" not in scope
         app_mock.assert_not_called()
 
     @pytest.mark.asyncio
@@ -4770,6 +4978,10 @@ class TestLifespanAdvanced:
         # First-Party
         import mcpgateway.main as main_mod
 
+        # Mock database bootstrap to prevent migration issues with in-memory DB
+        monkeypatch.setattr("mcpgateway.utils.db_isready.wait_for_db_ready", MagicMock())
+        monkeypatch.setattr("mcpgateway.bootstrap_db.main", AsyncMock())
+
         class FakeEvent:
             def __init__(self):
                 self._set = False
@@ -5082,6 +5294,10 @@ class TestLifespanAdvanced:
         # First-Party
         import mcpgateway.main as main_mod
 
+        # Mock database bootstrap to prevent migration issues with in-memory DB
+        monkeypatch.setattr("mcpgateway.utils.db_isready.wait_for_db_ready", MagicMock())
+        monkeypatch.setattr("mcpgateway.bootstrap_db.main", AsyncMock())
+
         await self._prepare_lifespan_stubs(monkeypatch, plugins_enabled=True)
         # The lifespan's outer handler converts errors whose message contains
         # "Plugin initialization failed" to a clean ``SystemExit(1)``; matching
@@ -5099,6 +5315,12 @@ class TestLifespanAdvanced:
     @pytest.mark.asyncio
     async def test_lifespan_marks_degraded_when_init_factory_fails_and_plugins_disabled(self, monkeypatch):
         """Plugins disabled but opportunistic init fails → gateway still boots, node is marked degraded."""
+        # Use fresh in-memory database to avoid state conflicts
+        monkeypatch.setattr("mcpgateway.config.settings.database_url", "sqlite:///:memory:")
+
+        # Mock database bootstrap to prevent migration issues with in-memory DB
+        monkeypatch.setattr("mcpgateway.utils.db_isready.wait_for_db_ready", MagicMock())
+        monkeypatch.setattr("mcpgateway.bootstrap_db.main", AsyncMock())
         # Use fresh in-memory database to avoid state conflicts
         monkeypatch.setattr("mcpgateway.config.settings.database_url", "sqlite:///:memory:")
 
@@ -5129,6 +5351,10 @@ class TestLifespanAdvanced:
         # First-Party
         import mcpgateway.main as main_mod
 
+        # Mock database bootstrap to prevent migration issues with in-memory DB
+        monkeypatch.setattr("mcpgateway.utils.db_isready.wait_for_db_ready", MagicMock())
+        monkeypatch.setattr("mcpgateway.bootstrap_db.main", AsyncMock())
+
         await self._prepare_lifespan_stubs(monkeypatch, plugins_enabled=False)
         # Keep startup clean so we actually reach the shutdown block.
         monkeypatch.setattr(main_mod, "init_plugin_manager_factory", MagicMock())
@@ -5137,6 +5363,34 @@ class TestLifespanAdvanced:
         # Must not raise — the shutdown block swallows and DEBUG-logs.
         async with main_mod.lifespan(main_mod.app):
             pass
+
+    @pytest.mark.asyncio
+    async def test_lifespan_starts_and_stops_dataplane_publisher(self, monkeypatch):
+        """Cover experimental dataplane publisher startup and shutdown wiring."""
+        monkeypatch.setattr("mcpgateway.config.settings.database_url", "sqlite:///:memory:")
+
+        # First-Party
+        import mcpgateway.main as main_mod
+
+        monkeypatch.setattr("mcpgateway.utils.db_isready.wait_for_db_ready", MagicMock())
+        monkeypatch.setattr("mcpgateway.bootstrap_db.main", AsyncMock())
+
+        await self._prepare_lifespan_stubs(monkeypatch, plugins_enabled=False)
+        monkeypatch.setattr(main_mod, "init_plugin_manager_factory", MagicMock())
+        monkeypatch.setattr(main_mod.settings, "dataplane_publisher", True)
+
+        dataplane_publisher = MagicMock()
+        dataplane_publisher.start = AsyncMock()
+        dataplane_publisher.shutdown = AsyncMock()
+        dataplane_publisher_factory = MagicMock(return_value=dataplane_publisher)
+        monkeypatch.setattr(main_mod, "DataplanePublisherService", dataplane_publisher_factory)
+
+        async with main_mod.lifespan(main_mod.app):
+            pass
+
+        dataplane_publisher_factory.assert_called_once_with()
+        dataplane_publisher.start.assert_awaited_once()
+        dataplane_publisher.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_shutdown_services_continues_on_exception(self):
@@ -5626,6 +5880,7 @@ class TestUtilityFunctions:
         monkeypatch.setattr(main_mod, "get_token_teams_from_request", lambda _req: [])
 
         monkeypatch.setattr(main_mod.session_registry, "add_session", AsyncMock())
+        monkeypatch.setattr(main_mod.session_registry, "set_session_owner", AsyncMock())
         monkeypatch.setattr(main_mod.session_registry, "respond", AsyncMock(return_value=None))
         monkeypatch.setattr(main_mod.session_registry, "register_respond_task", MagicMock())
         monkeypatch.setattr(main_mod.asyncio, "create_task", MagicMock(return_value=MagicMock()))
@@ -9689,9 +9944,11 @@ class TestRpcHandling:
     async def test_handle_rpc_session_affinity_invalid_session_executes_locally(self, monkeypatch):
         """Cover session affinity branch when the MCP session id is invalid."""
         monkeypatch.setattr(settings, "mcpgateway_session_affinity_enabled", True)
+        monkeypatch.setattr(settings, "use_stateful_sessions", False)
         payload = {"jsonrpc": "2.0", "id": "aff-1", "method": "ping", "params": {}}
         request = self._make_request(payload)
         request.headers = {"mcp-session-id": "not-valid"}
+        request.client = SimpleNamespace(host="127.0.0.1")
 
         with patch("mcpgateway.services.session_affinity.SessionAffinity.is_valid_mcp_session_id", return_value=False):
             result = await handle_rpc(request, db=MagicMock(), user={"email": "user@example.com"})
@@ -9726,9 +9983,11 @@ class TestRpcHandling:
     async def test_handle_rpc_session_affinity_pool_not_initialized(self, monkeypatch):
         """Cover RuntimeError branch when pool isn't initialized."""
         monkeypatch.setattr(settings, "mcpgateway_session_affinity_enabled", True)
+        monkeypatch.setattr(settings, "use_stateful_sessions", False)
         payload = {"jsonrpc": "2.0", "id": "aff-3", "method": "ping", "params": {}}
         request = self._make_request(payload)
         request.headers = {"mcp-session-id": "sess-123"}
+        request.client = SimpleNamespace(host="127.0.0.1")
 
         with (
             patch("mcpgateway.services.session_affinity.SessionAffinity.is_valid_mcp_session_id", return_value=True),
@@ -9740,9 +9999,11 @@ class TestRpcHandling:
     async def test_handle_rpc_session_affinity_internal_forwarded_executes_locally(self, monkeypatch):
         """Cover internally forwarded header branch."""
         monkeypatch.setattr(settings, "mcpgateway_session_affinity_enabled", True)
+        monkeypatch.setattr(settings, "use_stateful_sessions", False)
         payload = {"jsonrpc": "2.0", "id": "aff-4", "method": "ping", "params": {}}
         request = self._make_request(payload)
         request.headers = {"mcp-session-id": "sess-123", "x-forwarded-internally": "true"}
+        request.client = SimpleNamespace(host="127.0.0.1")
 
         result = await handle_rpc(request, db=MagicMock(), user={"email": "user@example.com"})
         assert result["result"] == {}
@@ -12063,6 +12324,10 @@ class TestRemainingCoverageGaps:
             "toolops_enabled": True,
         }
 
+        # Ensure REDIS_AVAILABLE reflects actual install state; prior tests that
+        # reload session_registry with redis.asyncio=None pollute this flag in-place.
+        monkeypatch.setattr("mcpgateway.cache.session_registry.REDIS_AVAILABLE", True)
+
         mod = _import_fresh_main_module(monkeypatch, overrides=overrides, env={"PLUGINS_ENABLED": "true"}, force_import_error=force_error)
 
         # Allow the import-time bootstrap_db create_task (running-loop branch) to complete.
@@ -12491,6 +12756,10 @@ class TestRemainingCoverageGaps:
 
         # First-Party
         import mcpgateway.main as main_mod
+
+        # Mock database bootstrap to prevent migration issues with in-memory DB
+        monkeypatch.setattr("mcpgateway.utils.db_isready.wait_for_db_ready", MagicMock())
+        monkeypatch.setattr("mcpgateway.bootstrap_db.main", AsyncMock())
 
         def make_service():  # noqa: ANN001 - local test helper
             service = MagicMock()
