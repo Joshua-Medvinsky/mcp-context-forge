@@ -14300,7 +14300,6 @@ async def admin_test_gateway(
     pinned_resolved_ip = validated_gateway_target["resolved_ip"]
 
     parsed_validated_base_url = urllib.parse.urlparse(validated_base_url)
-    pinned_ip_is_ipv6 = ":" in pinned_resolved_ip
     if parsed_validated_base_url.port is not None:
         original_authority = f"{validated_hostname}:{parsed_validated_base_url.port}"
     else:
